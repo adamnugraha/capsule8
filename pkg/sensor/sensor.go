@@ -558,16 +558,16 @@ func (s *Sensor) IsKernelSymbolAvailable(symbol string) bool {
 }
 
 // Map for rewriting kprobe fetch args in kernel 4.17+
-var fetchArgsRewriteMap = map[string]string{
+var fetchArgsReplacements = [][2]string{
 	// N.B. %di must come first
-	"%di":  "+112(%di)", // pt_regs+0x70
-	"%si":  "+104(%di)", // +0x68
-	"%dx":  "+96(%di)",  // +0x60
-	"%cx":  "+88(%di)",  // +0x58
-	"%ax":  "+80(%di)",  // +0x50
-	"%r8":  "+72(%di)",  // +0x48
-	"%r9":  "+64(%di)",  // +0x40
-	"%r10": "+56(%di)",  // +0x38
+	{"%di", "+112(%di)"}, // pt_regs+0x70
+	{"%si", "+104(%di)"}, // +0x68
+	{"%dx", "+96(%di)"},  // +0x60
+	{"%cx", "+88(%di)"},  // +0x58
+	{"%ax", "+80(%di)"},  // +0x50
+	{"%r8", "+72(%di)"},  // +0x48
+	{"%r9", "+64(%di)"},  // +0x40
+	{"%r10", "+56(%di)"}, // +0x38
 }
 
 // RegisterKprobe registers a kprobe with the sensor's EventMonitor instance,
@@ -599,7 +599,9 @@ func (s *Sensor) RegisterKprobe(
 
 					// rewrite `output` (the kprobe fetch args) to account for
 					// the only argument to the syscall handler being `pt_regs *regs`
-					for srcReg, dstExpr := range fetchArgsRewriteMap {
+					for _, rewritePair := range fetchArgsReplacements {
+						srcReg := rewritePair[0]
+						dstExpr := rewritePair[1]
 						output = strings.Replace(output, srcReg, dstExpr, -1)
 					}
 					glog.V(2).Infof("Rewrote kprobe fetch args to %q", output)
