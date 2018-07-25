@@ -38,9 +38,11 @@ import (
 )
 
 type newSensorOptions struct {
-	perfEventDir string
-	tracingDir   string
-	procFS       proc.FileSystem
+	perfEventDir          string
+	tracingDir            string
+	procFS                proc.FileSystem
+	eventSourceController perf.EventSourceController
+	cleanupFuncs          []func()
 }
 
 // NewSensorOption is used to implement optional arguments for NewSensor.
@@ -52,6 +54,15 @@ type NewSensorOption func(*newSensorOptions)
 func WithProcFileSystem(procFS proc.FileSystem) NewSensorOption {
 	return func(o *newSensorOptions) {
 		o.procFS = procFS
+	}
+}
+
+// WithEventSourceController is used to set the perf.EventSourceController to
+// use. This is not used by the sensor itself, but passed through when a new
+// EventMonitor is created.
+func WithEventSourceController(controller perf.EventSourceController) NewSensorOption {
+	return func(o *newSensorOptions) {
+		o.eventSourceController = controller
 	}
 }
 
@@ -69,6 +80,15 @@ func WithPerfEventDir(perfEventDir string) NewSensorOption {
 func WithTracingDir(tracingDir string) NewSensorOption {
 	return func(o *newSensorOptions) {
 		o.tracingDir = tracingDir
+	}
+}
+
+// WithCleanupFunc is used to register a cleanup function that will be called
+// when the sensor is stopped. Multiple cleanup functions may be registered,
+// and will be called in the reverse order in which the were registered.
+func WithCleanupFunc(cleanupFunc func()) NewSensorOption {
+	return func(o *newSensorOptions) {
+		o.cleanupFuncs = append(o.cleanupFuncs, cleanupFunc)
 	}
 }
 
@@ -132,6 +152,13 @@ type Sensor struct {
 	// argument filters
 	dummySyscallEventID    uint64
 	dummySyscallEventCount int64
+
+	// A reference to the event source controller in use.
+	EventSourceController perf.EventSourceController
+
+	// Cleanup functions to be run (in reverse order) when the sensor is
+	// stopped.
+	cleanupFuncs []func()
 }
 
 type queuedSamples struct {
@@ -168,12 +195,14 @@ func NewSensor(options ...NewSensorOption) (*Sensor, error) {
 	sensorID := hex.EncodeToString(randomBytes)
 
 	s := &Sensor{
-		ID:                sensorID,
-		bootMonotimeNanos: sys.CurrentMonotonicRaw(),
-		perfEventDir:      opts.perfEventDir,
-		tracingDir:        opts.tracingDir,
-		ProcFS:            opts.procFS,
-		eventMap:          newSafeSubscriptionMap(),
+		ID:                    sensorID,
+		bootMonotimeNanos:     sys.CurrentMonotonicRaw(),
+		perfEventDir:          opts.perfEventDir,
+		tracingDir:            opts.tracingDir,
+		ProcFS:                opts.procFS,
+		eventMap:              newSafeSubscriptionMap(),
+		EventSourceController: opts.eventSourceController,
+		cleanupFuncs:          opts.cleanupFuncs,
 	}
 	s.dispatchCond = sync.Cond{L: &s.dispatchMutex}
 
@@ -210,6 +239,7 @@ func (s *Sensor) Start() error {
 			glog.V(1).Info(err)
 			return err
 		}
+		s.cleanupFuncs = append(s.cleanupFuncs, s.unmountTraceFS)
 	}
 
 	// If there is no mounted cgroupfs for the perf_event cgroup, we can't
@@ -221,6 +251,9 @@ func (s *Sensor) Start() error {
 		if err := s.mountPerfEventCgroupFS(); err != nil {
 			glog.V(1).Info(err)
 			// This is not a fatal error condition, proceed on
+		} else {
+			s.cleanupFuncs = append(s.cleanupFuncs,
+				s.unmountPerfEventCgroupFS)
 		}
 	}
 
@@ -294,12 +327,8 @@ func (s *Sensor) Stop() {
 		glog.V(2).Info("Sensor-global EventMonitor stopped successfully")
 	}
 
-	if s.tracingDirMounted {
-		s.unmountTraceFS()
-	}
-
-	if s.perfEventDirMounted {
-		s.unmountPerfEventCgroupFS()
+	for x := len(s.cleanupFuncs) - 1; x >= 0; x-- {
+		s.cleanupFuncs[x]()
 	}
 }
 
@@ -376,6 +405,8 @@ func (s *Sensor) createEventMonitor() error {
 	eventMonitorOptions := []perf.EventMonitorOption{}
 	eventMonitorOptions = append(eventMonitorOptions,
 		perf.WithProcFileSystem(s.ProcFS))
+	eventMonitorOptions = append(eventMonitorOptions,
+		perf.WithEventSourceController(s.EventSourceController))
 
 	if len(s.tracingDir) > 0 {
 		eventMonitorOptions = append(eventMonitorOptions,
@@ -444,11 +475,10 @@ func (s *Sensor) createEventMonitor() error {
 func (s *Sensor) IsKernelSymbolAvailable(symbol string) bool {
 	// If the kallsyms mapping is nil, the table could not be
 	// loaded for some reason; assume anything is available
-	if s.kallsyms == nil {
-		return true
+	ok := true
+	if s.kallsyms != nil {
+		_, ok = s.kallsyms[symbol]
 	}
-
-	_, ok := s.kallsyms[symbol]
 	return ok
 }
 
