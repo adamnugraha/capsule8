@@ -557,8 +557,22 @@ func (s *Sensor) IsKernelSymbolAvailable(symbol string) bool {
 	return ok
 }
 
+// Map for rewriting kprobe fetch args in kernel 4.17+
+var fetchArgsRewriteMap = map[string]string{
+	// N.B. %di must come first
+	"%di":  "+112(%di)", // pt_regs+0x70
+	"%si":  "+104(%di)", // +0x68
+	"%dx":  "+96(%di)",  // +0x60
+	"%cx":  "+88(%di)",  // +0x58
+	"%ax":  "+80(%di)",  // +0x50
+	"%r8":  "+72(%di)",  // +0x48
+	"%r9":  "+64(%di)",  // +0x40
+	"%r10": "+56(%di)",  // +0x38
+}
+
 // RegisterKprobe registers a kprobe with the sensor's EventMonitor instance,
-// but before doing so, ensures that the kernel symbol is available.
+// but before doing so, ensures that the kernel symbol is available and potentially
+// transforms it to account for new kernel changes.
 func (s *Sensor) RegisterKprobe(
 	address string,
 	onReturn bool,
@@ -573,14 +587,22 @@ func (s *Sensor) RegisterKprobe(
 				address = actual
 			}
 		} else {
-			// Linux 4.17 changes how syscall handlers are named, adding a `__x64_`
-			// prefix. Automatically try to prepend that if we're registering a
-			// kprobe on a syscall handler.
+			// Linux 4.17 changes how syscall handlers are done. It adds a `__x64_`
+			// prefix and also changes how arguments are handled in the syscall handler.
+			// Automatically try to prepend `__x64_` if we're registering a kprobe
+			// on a syscall handler, and if it succeeds, rewrite the kprobe fetch args.
 			if strings.HasPrefix(address, "sys_") {
 				actual, ok := s.kallsyms["__x64_"+address]
 				if ok {
 					glog.V(2).Infof("Using %q for kprobe symbol %q", actual, address)
 					address = actual
+
+					// rewrite `output` (the kprobe fetch args) to account for
+					// the only argument to the syscall handler being `pt_regs *regs`
+					for srcReg, dstExpr := range fetchArgsRewriteMap {
+						output = strings.Replace(output, srcReg, dstExpr, -1)
+					}
+					glog.V(2).Infof("Rewrote kprobe fetch args to %q", output)
 				} else {
 					return 0, fmt.Errorf("Kernel symbol not found: %s", address)
 				}
